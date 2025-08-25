@@ -3,6 +3,7 @@ import json
 import glob
 import math
 import argparse
+import time
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -11,6 +12,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score, f1_score
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import BallTree
 import joblib
 
 # --- Optional GPU (XGBoost) ---
@@ -34,6 +36,7 @@ except Exception:
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 RF_ESTIMATORS = 300
+EARTH_KM = 6371.0088
 
 XGB_PARAMS = {
     "max_depth": 7,
@@ -125,7 +128,7 @@ def in_any_window(hour_float: float, windows: List[Tuple[str, str]]) -> bool:
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0088
+    R = EARTH_KM
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
     dlat = p2 - p1
@@ -600,7 +603,7 @@ def _is_parking_name(name: Optional[str]) -> bool:
 
 
 # =========================
-# 커맨드: train / predict
+# 커맨드: train / predict (CLI)
 # =========================
 def cmd_train(args):
     os.makedirs(args.model_dir, exist_ok=True)
@@ -759,7 +762,6 @@ def cmd_predict(args):
             idx = get_class_index(le.classes_, cls_name)
             return round(float(proba_adj[idx]), 4) if idx is not None else 0.0
 
-        # (변경) lat/lng 추가(콘솔 출력은 기존 prkCd/areaCd 사용하므로 그대로 보존)
         rows.append({
             "prkCd": lot.get("prkCd"),
             "prkNm": lot.get("prkNm"),
@@ -859,10 +861,9 @@ def cmd_predict(args):
                                .head(alt_top_k).reset_index(drop=True)
                 alt_list = alt_df.to_dict(orient="records")
 
-    # ===== JSON은 무조건 먼저 기록 =====
+    # ===== JSON은 무조건 먼저 기록 (CLI) =====
     if args.out_json:
         try:
-            # (추가) 반환 필드 정리: areaCd/prkCd 제외, lat/lon만 노출
             items_slim = []
             for r in df_out.head(args.top_k).to_dict(orient="records"):
                 items_slim.append({
@@ -924,20 +925,7 @@ def cmd_predict(args):
             print(f"{i+1:02d}. [{r['pred_level']}] {r['prkNm']} (코드:{r['prkCd']}, 구역:{r['areaCd']}) "
                   f"거리 {r['dist_km']:.2f}km | 점수 {r['score']:.2f} "
                   f"(여:{r['p_여유']:.2f}/보:{r['p_보통']:.2f}/혼:{r['p_혼잡']:.2f})")
-        if is_congested_now and len(alt_list):
-            title = "[대체 추천: {}] {}".format(
-                "새 좌표 중심" if getattr(args, "alt_mode", "ring") == "recenter" else "초기 반경 밖",
-                "반경 {:.1f}km 이내".format(float(getattr(args, "alt_max_km", 3.0)))
-                if getattr(args, "alt_mode", "ring") == "recenter"
-                else "구간 ({:.1f}~{:.1f}] km".format(float(used_r), float(getattr(args, "alt_max_km", 3.0)))
-            )
-            print("\n" + title)
-            for r in alt_list:
-                print(f"- {r['prkNm']} (코드:{r['prkCd']}, 구역:{r['areaCd']}) "
-                      f"거리 {r['dist_km']:.2f}km | 예측:{r['pred_level']} "
-                      f"(여:{r['p_여유']:.2f}/보:{r['p_보통']:.2f}/혼:{r['p_혼잡']:.2f})")
     else:
-        # 리스트 모드 OFF: 거리 가중 풀링 후 단일 등급
         weights = 1.0 / df_out["dist_km"].clip(lower=1e-3)
         denom = weights.sum()
         p_y = (df_out["p_여유"] * weights).sum() / denom
@@ -955,6 +943,321 @@ def cmd_predict(args):
         print(f"[예측 시각] {args.arrival}")
         print(f"[검색 반경] {used_r:.1f} km")
         print(f"[혼잡도 등급] {cls_txt} (신뢰도≈{conf:.2f})")
+
+
+# =========================
+# 메모리 상주 런타임 (Fast API용)
+# =========================
+class FastRuntime:
+    """
+    - 아티팩트(모델/라벨/xcols/area_type/lots_meta) 메모리 상주
+    - BallTree(haversine)로 반경 내 후보 즉시 탐색
+    - 기존 로직을 재사용하여 dict 결과 반환
+    """
+    def __init__(self, model_dir: str):
+        t0 = time.perf_counter()
+        self.model_dir = model_dir
+        # 아티팩트 1회 로드
+        self.clf = joblib.load(os.path.join(model_dir, "model_cls.joblib"))
+        with open(os.path.join(model_dir, "label_classes.json"), "r", encoding="utf-8") as f:
+            classes = json.load(f)["classes"]
+        self.le = LabelEncoder(); self.le.fit(classes)
+        with open(os.path.join(model_dir, "xcols.json"), "r", encoding="utf-8") as f:
+            self.xcols = json.load(f)["xcols"]
+        with open(os.path.join(model_dir, "area_type_map.json"), "r", encoding="utf-8") as f:
+            self.area_type_map = json.load(f)
+
+        self.lots_meta = pd.read_csv(os.path.join(model_dir, "lots_meta.csv"), encoding="utf-8")
+        # 정밀도 유지
+        self.lots_meta["lat"] = pd.to_numeric(self.lots_meta["lat"], errors="coerce").astype("float64")
+        self.lots_meta["lng"] = pd.to_numeric(self.lots_meta["lng"], errors="coerce").astype("float64")
+        self.lots_meta = self.lots_meta.dropna(subset=["lat", "lng"]).reset_index(drop=True)
+
+        # BallTree 준비(라디안)
+        pts_rad = np.deg2rad(self.lots_meta[["lat", "lng"]].to_numpy(dtype=np.float64))
+        self.tree = BallTree(pts_rad, metric="haversine")
+        self.pts_rad = pts_rad
+
+        self._t_init = time.perf_counter() - t0
+
+    def _neighbors_balltree(self, lat: float, lon: float, radius_km: float, top_k: int,
+                            backoff: bool) -> Tuple[pd.DataFrame, float]:
+        q = np.deg2rad(np.array([[lat, lon]], dtype=np.float64))
+
+        def query(r_km: float):
+            r_rad = r_km / EARTH_KM
+            ind, dist = self.tree.query_radius(q, r=r_rad, return_distance=True, sort_results=True)
+            idx = ind[0]; dkm = dist[0] * EARTH_KM
+            if len(idx) == 0:
+                return pd.DataFrame(), r_km
+            idx = idx[:top_k]; dkm = dkm[:top_k]
+            nb = self.lots_meta.iloc[idx].copy()
+            nb["dist_km"] = dkm
+            return nb.reset_index(drop=True), r_km
+
+        if not backoff:
+            return query(radius_km)
+
+        seq = [radius_km]
+        for r in [1.0, 2.0, 5.0, 10.0]:
+            if r > radius_km:
+                seq.append(r)
+        for r in seq:
+            nb, used = query(r)
+            if len(nb):
+                return nb, used
+        return pd.DataFrame(), seq[-1]
+
+    def predict(self,
+                lat: float, lon: float, arrival: str,
+                radius: float = 0.5, top_k: int = 15,
+                sort_by: str = "score",
+                list_mode: bool = True,
+                exact_radius: bool = True,
+                fill_external: bool = True,
+                use_places: bool = False,
+                use_weather: bool = False,
+                google_api_key: Optional[str] = None,
+                owm_api_key: Optional[str] = None,
+                alt_mode: str = "ring",
+                alt_max_km: float = 3.0,
+                alt_top_k: int = 5,
+                alt_center_lat: Optional[float] = None,
+                alt_center_lon: Optional[float] = None,
+                places_radius_m: int = 1000) -> dict:
+        t0 = time.perf_counter()
+        now = pd.to_datetime(arrival)
+
+        # 1) 후보 선택 (BallTree)
+        neighbors, used_r = self._neighbors_balltree(
+            lat, lon, radius, top_k, backoff=not exact_radius
+        )
+
+        # 2) 외부 보강(옵션)
+        if (len(neighbors) < top_k) and fill_external and use_places:
+            gkey = google_api_key or os.environ.get("GOOGLE_API_KEY")
+            if gkey:
+                ext_df = discover_parking_via_places(lat, lon, places_radius_m, gkey, top_k)
+                if len(ext_df):
+                    base_cols = ["prkCd", "prkNm", "areaCd", "prkType", "lat", "lng", "dist_km"]
+                    if "dist_km" not in neighbors.columns:
+                        dkm = np.array([
+                            haversine_km(lat, lon, float(a), float(b))
+                            for a, b in neighbors[["lat", "lng"]].to_numpy()
+                        ])
+                        neighbors = neighbors.copy(); neighbors["dist_km"] = dkm
+                    combo = pd.concat(
+                        [neighbors[base_cols] if len(neighbors) else neighbors, ext_df[base_cols + ["types"]]],
+                        ignore_index=True
+                    )
+                    combo = combo.drop_duplicates(subset=["prkCd"]).sort_values("dist_km").head(top_k).reset_index(drop=True)
+                    neighbors = combo
+
+        if len(neighbors) == 0:
+            label, conf = global_fallback_predict(self.clf, self.le, self.xcols, self.area_type_map, arrival)
+            return {
+                "meta": {"arrival": arrival, "used_radius_km": float(used_r), "top_k": int(top_k)},
+                "items": [],
+                "alternatives": [],
+                "summary": {"pooled_level": label, "confidence": round(conf, 4)},
+                "_timing": {"init": self._t_init, "total": time.perf_counter() - t0}
+            }
+
+        facility_ctx_tag = None
+        weather_ctx = None
+        if use_places:
+            gkey = google_api_key or os.environ.get("GOOGLE_API_KEY")
+            if gkey:
+                types = fetch_place_types_google(lat, lon, int(max(200, radius * 1000)), gkey, self.model_dir)
+                facility_ctx_tag = map_types_to_facility_tag(types) or facility_ctx_tag
+        if use_weather:
+            wkey = owm_api_key or os.environ.get("OWM_API_KEY")
+            if wkey:
+                weather_ctx = fetch_weather_owm(lat, lon, now, wkey, self.model_dir)
+
+        def build_row(areaCd: str, prkType: str):
+            base = {
+                "hour": now.hour, "minute": now.minute,
+                "dow": now.dayofweek, "is_weekend": int(now.dayofweek in (5, 6)),
+                "temp": 0.0, "humidity": 0.0, "pm10": 0.0,
+                "areaCd": areaCd, "prkType": prkType if isinstance(prkType, str) and prkType else "UNK",
+            }
+            row = pd.DataFrame([base])
+            row_oh = pd.get_dummies(row, columns=["areaCd", "prkType"], drop_first=False)
+            row_oh = row_oh.reindex(columns=self.xcols, fill_value=0.0)
+            return row_oh
+
+        rows = []
+        has_types = "types" in neighbors.columns
+        for _, lot in neighbors.iterrows():
+            Xrow = build_row(lot.get("areaCd", "EXT"), lot.get("prkType", "EXT"))
+            if hasattr(self.clf, "predict_proba"):
+                proba = self.clf.predict_proba(Xrow)[0]
+            else:
+                pred = self.clf.predict(Xrow)[0]
+                proba = np.zeros(len(self.le.classes_), dtype=float); proba[int(pred)] = 1.0
+
+            lot_facility_tag = map_types_to_facility_tag(lot.get("types", [])) if has_types else None
+            area_t = self.area_type_map.get(lot.get("areaCd", "EXT"), "MIXED")
+            if lot_facility_tag == "CULTURE":
+                area_t = "ENTERTAINMENT"
+            elif lot_facility_tag == "OFFICE":
+                area_t = "OFFICE"
+            elif lot_facility_tag == "PARK":
+                area_t = "MIXED"
+
+            proba_adj = apply_rule_adjustment(
+                proba, self.le.classes_, area_t, now,
+                facility_tag=lot_facility_tag or facility_ctx_tag,
+                weather=weather_ctx
+            )
+
+            idx_max = int(np.argmax(proba_adj))
+            level_txt = self.le.inverse_transform([idx_max])[0]
+            score = congestion_score_from_proba(proba_adj, self.le.classes_)
+
+            def _p(cls_name):
+                idx = get_class_index(self.le.classes_, cls_name)
+                return round(float(proba_adj[idx]), 4) if idx is not None else 0.0
+
+            rows.append({
+                "prkCd": lot.get("prkCd"),
+                "prkNm": lot.get("prkNm"),
+                "areaCd": lot.get("areaCd"),
+                "lat": float(lot.get("lat", 0.0)),
+                "lng": float(lot.get("lng", 0.0)),
+                "dist_km": float(lot.get("dist_km", 0.0)),
+                "pred_level": level_txt,
+                "score": round(float(score), 4),
+                "p_여유": _p("여유"),
+                "p_보통": _p("보통"),
+                "p_혼잡": _p("혼잡"),
+            })
+
+        df_out = pd.DataFrame(rows)
+        if sort_by == "score":
+            df_out = df_out.sort_values(["score", "dist_km"], ascending=[False, True]).reset_index(drop=True)
+        else:
+            df_out = df_out.sort_values(["dist_km", "score"], ascending=[True, False]).reset_index(drop=True)
+
+        representative_level = str(df_out.iloc[0]["pred_level"]) if len(df_out) else None
+        is_congested_now = (representative_level == "혼잡")
+
+        alt_list: List[dict] = []
+        if is_congested_now:
+            if alt_mode == "recenter":
+                if alt_center_lat is None or alt_center_lon is None:
+                    alt_base = pd.DataFrame()
+                else:
+                    q2 = np.deg2rad(np.array([[float(alt_center_lat), float(alt_center_lon)]], dtype=np.float64))
+                    r2 = float(alt_max_km) / EARTH_KM
+                    ind2, dist2 = self.tree.query_radius(q2, r=r2, return_distance=True, sort_results=True)
+                    idx2 = ind2[0]; dkm2 = dist2[0] * EARTH_KM
+                    alt_base = self.lots_meta.iloc[idx2].copy()
+                    alt_base["alt_dist_km"] = dkm2
+            else:  # ring
+                q0 = np.deg2rad(np.array([[lat, lon]], dtype=np.float64))
+                indA, distA = self.tree.query_radius(q0, r=float(alt_max_km)/EARTH_KM, return_distance=True, sort_results=True)
+                idxA = indA[0]; dkmA = distA[0] * EARTH_KM
+                if len(idxA):
+                    mask = (dkmA > float(used_r)) & (dkmA <= float(alt_max_km))
+                    idx_ring = idxA[mask]
+                    dkm_ring = dkmA[mask]
+                    alt_base = self.lots_meta.iloc[idx_ring].copy()
+                    alt_base["dist_km"] = dkm_ring
+                else:
+                    alt_base = pd.DataFrame()
+
+            if len(alt_base):
+                alt_base = alt_base[alt_base["prkNm"].apply(_is_parking_name)].copy()
+            if len(alt_base):
+                alt_rows = []
+                for _, lot in alt_base.iterrows():
+                    Xrow = build_row(lot.get("areaCd", "EXT"), lot.get("prkType", "EXT"))
+                    if hasattr(self.clf, "predict_proba"):
+                        proba = self.clf.predict_proba(Xrow)[0]
+                    else:
+                        pred = self.clf.predict(Xrow)[0]
+                        proba = np.zeros(len(self.le.classes_), dtype=float); proba[int(pred)] = 1.0
+
+                    area_t = self.area_type_map.get(lot.get("areaCd", "EXT"), "MIXED")
+                    proba_adj = apply_rule_adjustment(
+                        proba, self.le.classes_, area_t, now,
+                        facility_tag=facility_ctx_tag,
+                        weather=weather_ctx
+                    )
+
+                    def _p(cls_name):
+                        idx = get_class_index(self.le.classes_, cls_name)
+                        return round(float(proba_adj[idx]), 4) if idx is not None else 0.0
+
+                    idx_max = int(np.argmax(proba_adj))
+                    level_txt = self.le.inverse_transform([idx_max])[0]
+                    dist_val = float(lot["alt_dist_km"]) if "alt_dist_km" in lot else float(lot.get("dist_km", 0.0))
+                    alt_rows.append({
+                        "prkCd": lot.get("prkCd"),
+                        "prkNm": lot.get("prkNm"),
+                        "areaCd": lot.get("areaCd"),
+                        "lat": float(lot.get("lat", 0.0)),
+                        "lng": float(lot.get("lng", 0.0)),
+                        "dist_km": dist_val,
+                        "pred_level": level_txt,
+                        "p_여유": _p("여유"),
+                        "p_보통": _p("보통"),
+                        "p_혼잡": _p("혼잡"),
+                        "score": float(_p("혼잡") + 0.5 * _p("보통")),
+                    })
+
+                alt_df = pd.DataFrame(alt_rows)
+                alt_df = alt_df[alt_df["pred_level"].isin(["여유", "보통"])].copy()
+                if len(alt_df):
+                    alt_df = alt_df.sort_values(by=["score", "dist_km"], ascending=[False, True]) \
+                                   .head(int(alt_top_k)).reset_index(drop=True)
+                    alt_list = alt_df.to_dict(orient="records")
+
+        items_slim = []
+        for r in df_out.head(top_k).to_dict(orient="records"):
+            items_slim.append({
+                "name": r.get("prkNm"),
+                "lat": float(r.get("lat", 0.0)),
+                "lon": float(r.get("lng", 0.0)),
+                "dist_km": float(r.get("dist_km", 0.0)),
+                "pred_level": r.get("pred_level"),
+                "score": float(r.get("score", 0.0)),
+                "p_relaxed": float(r.get("p_여유", 0.0)),
+                "p_normal": float(r.get("p_보통", 0.0)),
+                "p_congested": float(r.get("p_혼잡", 0.0)),
+            })
+
+        alts_slim = []
+        for r in alt_list:
+            alts_slim.append({
+                "name": r.get("prkNm"),
+                "lat": float(r.get("lat", 0.0)),
+                "lon": float(r.get("lng", 0.0)),
+                "dist_km": float(r.get("dist_km", 0.0)),
+                "pred_level": r.get("pred_level"),
+                "score": float(r.get("score", 0.0)),
+                "p_relaxed": float(r.get("p_여유", 0.0)),
+                "p_normal": float(r.get("p_보통", 0.0)),
+                "p_congested": float(r.get("p_혼잡", 0.0)),
+            })
+
+        return {
+            "meta": {
+                "arrival": arrival,
+                "used_radius_km": float(used_r),
+                "top_k": int(top_k),
+                "sort_by": sort_by,
+                "list_mode": bool(list_mode),
+                "representative_level": representative_level,
+                "alt_mode": alt_mode,
+                "alt_max_km": float(alt_max_km),
+            },
+            "items": items_slim,
+            "alternatives": alts_slim,
+            "_timing": {"init": self._t_init, "total": time.perf_counter() - t0}
+        }
 
 
 # =========================
