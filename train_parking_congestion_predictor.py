@@ -1,4 +1,3 @@
-
 import os
 import json
 import glob
@@ -80,8 +79,8 @@ WEEKEND_RULE = {
 LEVEL_NORMALIZE = {
     "여유": "여유",
     "보통": "보통",
-    "약간 혼잡": "보통",
-    "약간 붐빔": "보통",
+    "약간 혼잡": "혼잡",
+    "약간 붐빔": "혼잡",
     "붐빔": "혼잡",
     "혼잡": "혼잡",
     "매우 혼잡": "혼잡",
@@ -395,7 +394,6 @@ def _enforce_min_prob_for_class(p: np.ndarray, idx: int, min_prob: float) -> np.
     if remaining <= 0:
         p[idx] = 1.0
         return p
-    # 목표: p'[idx] = min_prob, 나머지 합 = 1 - min_prob, 기존 비율 유지
     scale = (1.0 - min_prob) / remaining
     for i in range(len(p)):
         if i != idx:
@@ -413,9 +411,7 @@ def apply_rule_adjustment(
     facility_tag: Optional[str] = None,
     weather: Optional[dict] = None
 ) -> np.ndarray:
-    """
-    예측 확률(proba)에 시간/구역/시설/날씨 가중치 적용 후 정규화.
-    """
+    """예측 확률(proba)에 시간/구역/시설/날씨 가중치 적용 후 정규화."""
     p = proba.copy()
 
     idx_cong = get_class_index(class_list, "혼잡")
@@ -445,10 +441,8 @@ def apply_rule_adjustment(
             p[idx_cong] *= CULTURE_WEEKEND_FACTOR_UP
             p = _enforce_min_prob_for_class(p, idx_cong, CULTURE_WEEKEND_MIN_PROB)
     elif facility_tag == "PARK":
-        # 야외는 날씨 영향만 약하게 받도록(아래 날씨 로직에서 처리)
         pass
     elif facility_tag == "OFFICE":
-        # 오피스는 기본 규칙으로 충분(추가 없음)
         pass
 
     # 날씨 보정
@@ -457,26 +451,22 @@ def apply_rule_adjustment(
         main = (weather.get("main") or "").lower()
         precip = bool(weather.get("is_precip", False))
 
-        # 비/눈/천둥 → 실내 선호(문화/쇼핑) ↑, 야외 ↓
         if precip or any(k in main for k in ["rain", "snow", "thunder"]):
             if facility_tag in (None, "CULTURE"):
                 p[idx_cong] *= 1.12
             if facility_tag == "PARK":
                 p[idx_cong] *= 0.92
 
-        # 기온 극단 → 실내 ↑ / 야외 ↓
         if isinstance(temp, (int, float)):
             if temp >= 30 or temp <= -2:
                 if facility_tag in (None, "CULTURE", "OFFICE"):
                     p[idx_cong] *= 1.08
                 if facility_tag == "PARK":
                     p[idx_cong] *= 0.95
-            # 선선/맑음 → 공원 이용↑(혼잡을 약간 ↑로 해석)
             if 15 <= temp <= 25 and any(k in main for k in ["clear", "cloud"]):
                 if facility_tag == "PARK":
                     p[idx_cong] *= 1.05
 
-    # 정규화
     s = p.sum()
     if s > 0:
         p /= s
@@ -596,6 +586,20 @@ def train_classifier(X: pd.DataFrame, y: np.ndarray, use_gpu: bool = True):
 
 
 # =========================
+# (추가) 주차장 이름 필터: '주차'/'parking' 포함 + 버스/승하차 등 제외
+# =========================
+def _is_parking_name(name: Optional[str]) -> bool:
+    if not isinstance(name, str):
+        return False
+    n = name.lower()
+    positive = ("주차", "주차장", "parking")
+    negative = ("관광버스", "버스전용", "승하차", "이륜차", "허용 구간")
+    if any(neg in n for neg in negative):
+        return False
+    return any(pos in n for pos in positive)
+
+
+# =========================
 # 커맨드: train / predict
 # =========================
 def cmd_train(args):
@@ -667,7 +671,6 @@ def cmd_predict(args):
                         lambda row: haversine_km(args.lat, args.lon, float(row["lat"]), float(row["lng"])),
                         axis=1
                     )
-                # 결합 & 중복 제거
                 combo = pd.concat(
                     [neighbors[base_cols] if len(neighbors) else neighbors, ext_df[base_cols + ["types"]]],
                     ignore_index=True
@@ -678,6 +681,18 @@ def cmd_predict(args):
     # 후보가 전혀 없으면 폴백
     if len(neighbors) == 0:
         label, conf = global_fallback_predict(clf, le, xcols, area_type_map, args.arrival)
+        # JSON 먼저 쓰기
+        if args.out_json:
+            try:
+                with open(args.out_json, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "meta": {"arrival": args.arrival, "used_radius_km": float(used_r), "top_k": int(args.top_k)},
+                        "items": [],
+                        "alternatives": [],
+                        "summary": {"pooled_level": label, "confidence": round(conf, 4)}
+                    }, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
         print(f"[예측 시각] {args.arrival}")
         print(f"[검색 반경] {used_r:.1f} km (주변 주차장 없음 → 폴백)")
         print(f"[혼잡도 등급] {label} (신뢰도≈{conf:.2f})")
@@ -740,15 +755,17 @@ def cmd_predict(args):
         level_txt = le.inverse_transform([idx_max])[0]
         score = congestion_score_from_proba(proba_adj, le.classes_)
 
-        # 확률 맵 안전 추출
         def _p(cls_name):
             idx = get_class_index(le.classes_, cls_name)
             return round(float(proba_adj[idx]), 4) if idx is not None else 0.0
 
+        # (변경) lat/lng 추가(콘솔 출력은 기존 prkCd/areaCd 사용하므로 그대로 보존)
         rows.append({
             "prkCd": lot.get("prkCd"),
             "prkNm": lot.get("prkNm"),
             "areaCd": lot.get("areaCd"),
+            "lat": float(lot.get("lat", 0.0)),
+            "lng": float(lot.get("lng", 0.0)),
             "dist_km": float(lot.get("dist_km", 0.0)),
             "pred_level": level_txt,
             "score": round(float(score), 4),
@@ -765,8 +782,140 @@ def cmd_predict(args):
     else:
         df_out = df_out.sort_values(["dist_km", "score"], ascending=[True, False]).reset_index(drop=True)
 
+    # 대표 등급(리스트의 1위)
+    representative_level = str(df_out.iloc[0]["pred_level"]) if len(df_out) else None
+    is_congested_now = (representative_level == "혼잡")
+
+    # --- 대체 추천 계산 ---
+    alt_list: List[dict] = []
+    if is_congested_now:
+        alt_mode = getattr(args, "alt_mode", "ring")
+        alt_max_km = float(getattr(args, "alt_max_km", 3.0))
+        alt_top_k = int(getattr(args, "alt_top_k", 5))
+
+        if alt_mode == "recenter":
+            alt_center_lat = float(args.alt_center_lat)
+            alt_center_lon = float(args.alt_center_lon)
+            alt_base = lots_meta.copy()
+            alt_base["alt_dist_km"] = alt_base.apply(
+                lambda row: haversine_km(alt_center_lat, alt_center_lon, float(row["lat"]), float(row["lng"])),
+                axis=1
+            )
+            alt_cands = alt_base[alt_base["alt_dist_km"] <= alt_max_km].copy()
+        else:  # ring
+            base = lots_meta.copy()
+            base["dist_km"] = base.apply(
+                lambda row: haversine_km(args.lat, args.lon, float(row["lat"]), float(row["lng"])),
+                axis=1
+            )
+            alt_cands = base[(base["dist_km"] > used_r) & (base["dist_km"] <= alt_max_km)].copy()
+
+        # (추가) 대체 후보는 '주차장'만 남기기
+        if len(alt_cands):
+            alt_cands = alt_cands[alt_cands["prkNm"].apply(_is_parking_name)].copy()
+
+        if len(alt_cands):
+            alt_rows = []
+            for _, lot in alt_cands.iterrows():
+                Xrow = build_row(lot.get("areaCd", "EXT"), lot.get("prkType", "EXT"))
+                if hasattr(clf, "predict_proba"):
+                    proba = clf.predict_proba(Xrow)[0]
+                else:
+                    pred = clf.predict(Xrow)[0]
+                    proba = np.zeros(len(le.classes_), dtype=float); proba[int(pred)] = 1.0
+
+                area_t = area_type_map.get(lot.get("areaCd", "EXT"), "MIXED")
+                proba_adj = apply_rule_adjustment(
+                    proba, le.classes_, area_t, now,
+                    facility_tag=facility_ctx_tag,
+                    weather=weather_ctx
+                )
+
+                def _p(cls_name):
+                    idx = get_class_index(le.classes_, cls_name)
+                    return round(float(proba_adj[idx]), 4) if idx is not None else 0.0
+
+                idx_max = int(np.argmax(proba_adj))
+                level_txt = le.inverse_transform([idx_max])[0]
+                dist_val = float(lot["alt_dist_km"] if (alt_mode == "recenter") else lot["dist_km"])
+                alt_rows.append({
+                    "prkCd": lot.get("prkCd"),
+                    "prkNm": lot.get("prkNm"),
+                    "areaCd": lot.get("areaCd"),
+                    "lat": float(lot.get("lat", 0.0)),
+                    "lng": float(lot.get("lng", 0.0)),
+                    "dist_km": dist_val,
+                    "pred_level": level_txt,
+                    "p_여유": _p("여유"),
+                    "p_보통": _p("보통"),
+                    "p_혼잡": _p("혼잡"),
+                    "score": float(_p("혼잡") + 0.5 * _p("보통")),
+                })
+
+            alt_df = pd.DataFrame(alt_rows)
+            alt_df = alt_df[alt_df["pred_level"].isin(["여유", "보통"])].copy()
+            if len(alt_df):
+                alt_df = alt_df.sort_values(by=["score", "dist_km"], ascending=[False, True]) \
+                               .head(alt_top_k).reset_index(drop=True)
+                alt_list = alt_df.to_dict(orient="records")
+
+    # ===== JSON은 무조건 먼저 기록 =====
+    if args.out_json:
+        try:
+            # (추가) 반환 필드 정리: areaCd/prkCd 제외, lat/lon만 노출
+            items_slim = []
+            for r in df_out.head(args.top_k).to_dict(orient="records"):
+                items_slim.append({
+                    "name": r.get("prkNm"),
+                    "lat": float(r.get("lat", 0.0)),
+                    "lon": float(r.get("lng", 0.0)),
+                    "dist_km": float(r.get("dist_km", 0.0)),
+                    "pred_level": r.get("pred_level"),
+                    "score": float(r.get("score", 0.0)),
+                    "p_relaxed": float(r.get("p_여유", 0.0)),
+                    "p_normal": float(r.get("p_보통", 0.0)),
+                    "p_congested": float(r.get("p_혼잡", 0.0)),
+                })
+
+            alts_slim = []
+            for r in alt_list:
+                alts_slim.append({
+                    "name": r.get("prkNm"),
+                    "lat": float(r.get("lat", 0.0)),
+                    "lon": float(r.get("lng", 0.0)),
+                    "dist_km": float(r.get("dist_km", 0.0)),
+                    "pred_level": r.get("pred_level"),
+                    "score": float(r.get("score", 0.0)),
+                    "p_relaxed": float(r.get("p_여유", 0.0)),
+                    "p_normal": float(r.get("p_보통", 0.0)),
+                    "p_congested": float(r.get("p_혼잡", 0.0)),
+                })
+
+            result = {
+                "meta": {
+                    "arrival": args.arrival,
+                    "used_radius_km": float(used_r),
+                    "top_k": int(args.top_k),
+                    "sort_by": args.sort_by,
+                    "list_mode": bool(args.list_mode),
+                    "representative_level": representative_level,
+                    "alt_mode": getattr(args, "alt_mode", "ring"),
+                    "alt_max_km": float(getattr(args, "alt_max_km", 3.0)),
+                },
+                "items": items_slim,
+                "alternatives": alts_slim,
+            }
+            with open(args.out_json, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            try:
+                with open(args.out_json, "w", encoding="utf-8") as f:
+                    json.dump({"error": f"failed to write json: {e.__class__.__name__}: {e}"}, f, ensure_ascii=False)
+            except Exception:
+                pass
+
+    # ===== 콘솔 출력 =====
     if args.list_mode:
-        # 리스트 모드: 상위 top_k 출력 + 저장
         print(f"[예측 시각] {args.arrival}")
         print(f"[검색 반경] {used_r:.1f} km")
         print(f"[후보 수] {len(df_out)} (요청 top_k={args.top_k})")
@@ -775,34 +924,37 @@ def cmd_predict(args):
             print(f"{i+1:02d}. [{r['pred_level']}] {r['prkNm']} (코드:{r['prkCd']}, 구역:{r['areaCd']}) "
                   f"거리 {r['dist_km']:.2f}km | 점수 {r['score']:.2f} "
                   f"(여:{r['p_여유']:.2f}/보:{r['p_보통']:.2f}/혼:{r['p_혼잡']:.2f})")
-        if args.out_csv:
-            df_out.to_csv(args.out_csv, index=False, encoding="utf-8-sig")
-            print(f"[저장] CSV → {args.out_csv}")
-        if args.out_json:
-            with open(args.out_json, "w", encoding="utf-8") as f:
-                json.dump(df_out.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
-            print(f"[저장] JSON → {args.out_json}")
-        return
-
-    # 리스트 모드 OFF: 거리 가중 풀링 후 단일 등급
-    weights = 1.0 / df_out["dist_km"].clip(lower=1e-3)
-    denom = weights.sum()
-    p_y = (df_out["p_여유"] * weights).sum() / denom
-    p_b = (df_out["p_보통"] * weights).sum() / denom
-    p_h = (df_out["p_혼잡"] * weights).sum() / denom
-    pooled_vec = np.array([p_y, p_b, p_h], dtype=float)
-    # le.classes_ 순서에 맞춰 재배치
-    proba_pooled = np.zeros(len(le.classes_), dtype=float)
-    for prob, cname in zip(pooled_vec, ["여유", "보통", "혼잡"]):
-        idx = get_class_index(le.classes_, cname)
-        if idx is not None:
-            proba_pooled[idx] = prob
-    cls_id = int(np.argmax(proba_pooled))
-    cls_txt = le.inverse_transform([cls_id])[0]
-    conf = float(np.max(proba_pooled))
-    print(f"[예측 시각] {args.arrival}")
-    print(f"[검색 반경] {used_r:.1f} km")
-    print(f"[혼잡도 등급] {cls_txt} (신뢰도≈{conf:.2f})")
+        if is_congested_now and len(alt_list):
+            title = "[대체 추천: {}] {}".format(
+                "새 좌표 중심" if getattr(args, "alt_mode", "ring") == "recenter" else "초기 반경 밖",
+                "반경 {:.1f}km 이내".format(float(getattr(args, "alt_max_km", 3.0)))
+                if getattr(args, "alt_mode", "ring") == "recenter"
+                else "구간 ({:.1f}~{:.1f}] km".format(float(used_r), float(getattr(args, "alt_max_km", 3.0)))
+            )
+            print("\n" + title)
+            for r in alt_list:
+                print(f"- {r['prkNm']} (코드:{r['prkCd']}, 구역:{r['areaCd']}) "
+                      f"거리 {r['dist_km']:.2f}km | 예측:{r['pred_level']} "
+                      f"(여:{r['p_여유']:.2f}/보:{r['p_보통']:.2f}/혼:{r['p_혼잡']:.2f})")
+    else:
+        # 리스트 모드 OFF: 거리 가중 풀링 후 단일 등급
+        weights = 1.0 / df_out["dist_km"].clip(lower=1e-3)
+        denom = weights.sum()
+        p_y = (df_out["p_여유"] * weights).sum() / denom
+        p_b = (df_out["p_보통"] * weights).sum() / denom
+        p_h = (df_out["p_혼잡"] * weights).sum() / denom
+        pooled_vec = np.array([p_y, p_b, p_h], dtype=float)
+        proba_pooled = np.zeros(len(le.classes_), dtype=float)
+        for prob, cname in zip(pooled_vec, ["여유", "보통", "혼잡"]):
+            idx = get_class_index(le.classes_, cname)
+            if idx is not None:
+                proba_pooled[idx] = prob
+        cls_id = int(np.argmax(proba_pooled))
+        cls_txt = le.inverse_transform([cls_id])[0]
+        conf = float(np.max(proba_pooled))
+        print(f"[예측 시각] {args.arrival}")
+        print(f"[검색 반경] {used_r:.1f} km")
+        print(f"[혼잡도 등급] {cls_txt} (신뢰도≈{conf:.2f})")
 
 
 # =========================
@@ -841,9 +993,25 @@ def main():
     pr.add_argument("--google_api_key", default=None, help="GOOGLE_API_KEY 환경변수 사용")
     pr.add_argument("--owm_api_key", default=None, help="OWM_API_KEY 환경변수 사용")
 
+    # --- 대체 추천 옵션 ---
+    pr.add_argument("--alt_mode", default="ring", choices=["ring", "recenter"],
+                    help="대체 추천 검색 모드: 'ring'(초기 반경 밖 링) 또는 'recenter'(새 좌표 중심)")
+    pr.add_argument("--alt_max_km", type=float, default=3.0,
+                    help="대체 추천 최대 검색 반경(km). ring 모드에선 (radius, alt_max_km] 구간을 사용")
+    pr.add_argument("--alt_top_k", type=int, default=5,
+                    help="대체 추천 최대 개수")
+    pr.add_argument("--alt_center_lat", type=float, default=None,
+                    help="recenter 모드에서 사용할 중심 위도")
+    pr.add_argument("--alt_center_lon", type=float, default=None,
+                    help="recenter 모드에서 사용할 중심 경도")
+
     pr.set_defaults(func=cmd_predict)
 
     args = ap.parse_args()
+    # recenter 모드 필수 파라미터 체크
+    if args.cmd == "predict" and args.alt_mode == "recenter":
+        if args.alt_center_lat is None or args.alt_center_lon is None:
+            raise SystemExit("recenter 모드에는 --alt_center_lat, --alt_center_lon 이 필요합니다.")
     args.func(args)
 
 
